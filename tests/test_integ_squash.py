@@ -14,11 +14,11 @@ import io
 from io import BytesIO
 import uuid
 
-from docker_scripts.squash import Squash
-from docker_scripts.errors import SquashError
+from docker_squash.squash import Squash
+from docker_squash.errors import SquashError
 
 if not six.PY3:
-    import docker_scripts.lib.xtarfile
+    import docker_squash.lib.xtarfile
 
 class ImageHelper(object):
     @staticmethod
@@ -126,14 +126,15 @@ class IntegSquash(unittest.TestCase):
                 output_path=self.output_path, load_image=self.load_image, tmp_dir=self.tmp_dir, development=self.development)
 
             self.image_id = squash.run()
-            self.history = self.docker.history(self.tag)
 
-            self.tar = self._save_image()
+            if not self.output_path:
+                self.history = self.docker.history(self.tag)
 
-            with tarfile.open(fileobj=self.tar, mode='r') as tar:
-                self.tarnames = tar.getnames()
+                self.tar = self._save_image()
 
-            if not self.output_path or self.load_image:
+                with tarfile.open(fileobj=self.tar, mode='r') as tar:
+                    self.tarnames = tar.getnames()
+
                 self.squashed_layer = self._squashed_layer()
                 self.layers = [o['Id'] for o in self.docker.history(self.tag)]
                 self.metadata = self.docker.inspect_image(self.tag)
@@ -471,9 +472,7 @@ class TestIntegSquash(IntegSquash):
         ''' % TestIntegSquash.BUSYBOX_IMAGE
 
         with self.Image(dockerfile) as image:
-            with self.SquashedImage(image, 2, output_path="image.tar") as squashed_image:
-                self.assertEqual(
-                    len(squashed_image.layers), len(image.layers) - 1)
+            with self.SquashedImage(image, 2, output_path="image.tar"):
                 with tarfile.open("image.tar", mode='r') as tar:
                     all_files = tar.getnames()
                     for name in all_files:
@@ -488,9 +487,7 @@ class TestIntegSquash(IntegSquash):
         ''' % TestIntegSquash.BUSYBOX_IMAGE
 
         with self.Image(dockerfile) as image:
-            with self.SquashedImage(image, 2, output_path="image.tar") as squashed_image:
-                self.assertEqual(
-                    len(squashed_image.layers), len(image.layers) - 1)
+            with self.SquashedImage(image, 2, output_path="image.tar"):
                 with tarfile.open("image.tar", mode='r') as tar:
                     squashed_layer_path = ImageHelper.top_layer_path(tar)
                     
@@ -542,32 +539,6 @@ class TestIntegSquash(IntegSquash):
                     # V1 image contains as many layer.tar archives as the image has layers
                     # We squashed 2 layers, so squashed image contains one layer less
                     self.assertEqual(len(image_data_layers), len(squashed_image_data_layers) + 1)
-
-
-    def test_load_image_produces_file_and_engine_image(self):
-        dockerfile = '''
-        FROM %s
-        RUN touch file
-        RUN touch another_file
-        ''' % TestIntegSquash.BUSYBOX_IMAGE
-
-        with self.Image(dockerfile) as image:
-            with self.SquashedImage(image, 2, output_path="image.tar", load_image=True) \
-                    as squashed_image:
-                self.assertEqual(
-                    len(squashed_image.layers), len(image.layers) - 1)
-                # first, make sure that the exported image exists and is ok
-                with tarfile.open("image.tar", mode='r') as tar:
-                    squashed_layer_path = ImageHelper.top_layer_path(tar)
-                    
-                    all_files = tar.getnames()
-
-                    self.assertIn("%s/json" % squashed_layer_path, all_files)
-                    self.assertIn("%s/layer.tar" % squashed_layer_path, all_files)
-                    self.assertIn("%s/VERSION" % squashed_layer_path, all_files)
-                    
-                # then also make sure that the image loaded back exists and is ok
-                self.assertIsInstance(image.metadata['Size'], int)
 
     # This is an edge case where we try to squash last 2 layers
     # but these layers do not create any content on filesystem

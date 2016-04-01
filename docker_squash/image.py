@@ -9,7 +9,7 @@ import six
 import tarfile
 import tempfile
 
-from docker_scripts.errors import SquashError
+from docker_squash.errors import SquashError
 
 
 class Chdir(object):
@@ -204,6 +204,10 @@ class Image(object):
         # Unpack exported image
         self._unpack(self.old_image_tar, self.old_image_dir)
 
+        # Remove the tar file early to save some space
+        self.log.debug("Removing exported tar (%s)..." % self.old_image_tar)
+        os.remove(self.old_image_tar)
+
         self.log.info("Squashing image '%s'..." % self.image)
 
     def _after_squashing(self):
@@ -214,11 +218,6 @@ class Image(object):
         Returns name of directories to layers in the exported tar archive.
         """
         pass
-
-    def unpack_image(self):
-        """
-        Unpacks old image.
-        """
 
     def export_tar_archive(self, target_tar_file):
         self._tar_image(target_tar_file, self.new_image_dir)
@@ -234,6 +233,7 @@ class Image(object):
         Prepare a list of files in all layers
         """
         files = {}
+
         for layer in layers:
             self.log.debug("Generating list of files in layer '%s'..." % layer)
             tar_file = os.path.join(directory, layer, "layer.tar")
@@ -259,19 +259,17 @@ class Image(object):
         return tmp_dir
 
     def _load_image(self, directory):
-        buf = six.BytesIO()
 
-        with tarfile.open(mode='w', fileobj=buf) as tar:
-            self.log.debug("Generating tar archive for the squashed image...")
-            with Chdir(directory):
-                tar.add(".")
-            self.log.debug("Archive generated")
+        tar_file = os.path.join(self.tmp_dir, "image.tar")
 
-        self.log.debug("Loading squashed image...")
-        self.docker.load_image(buf.getvalue())
-        self.log.debug("Image loaded!")
+        self._tar_image(tar_file, directory)
 
-        buf.close()
+        with open(tar_file, 'rb') as f:
+            self.log.debug("Loading squashed image...")
+            self.docker.load_image(f.read())
+            self.log.debug("Image loaded!")
+
+        os.remove(tar_file)
 
     def _tar_image(self, target_tar_file, directory):
         with tarfile.open(target_tar_file, 'w', format=tarfile.PAX_FORMAT) as tar:
@@ -339,10 +337,6 @@ class Image(object):
 
         with tarfile.open(tar_file, 'r') as tar:
             tar.extractall(path=directory)
-
-        # Remove the tar file early to save some space
-        self.log.debug("Removing exported tar (%s)..." % tar_file)
-        os.remove(tar_file)
 
         self.log.info("Archive unpacked!")
 
@@ -436,7 +430,7 @@ class Image(object):
 
         return False
 
-    def _marker_files(self, tar):
+    def _marker_files(self, tar, members):
         """
         Searches for marker files in the specified archive.
 
@@ -449,14 +443,14 @@ class Image(object):
         self.log.debug(
             "Searching for marker files in '%s' archive..." % tar.name)
 
-        for member in tar.getmembers():
+        for member in members:
             if '.wh.' in member.name:
                 self.log.debug("Found '%s' marker file" % member.name)
                 marker_files[member] = tar.extractfile(member)
 
         return marker_files
 
-    def _add_markers(self, markers, tar, layers_to_move, old_image_dir):
+    def _add_markers(self, markers, tar, files_in_layers):
         """
         This method is responsible for adding back all markers that were not
         added to the squashed layer AND files they refer to can be found in layers
@@ -469,9 +463,6 @@ class Image(object):
         else:
             # No marker files to add
             return
-
-        # Find all files in layers that we don't squash
-        files_in_layers = self._files_in_layers(layers_to_move, old_image_dir)
 
         for marker, marker_file in six.iteritems(markers):
             actual_file = marker.name.replace('.wh.', '')
@@ -509,6 +500,8 @@ class Image(object):
         with tarfile.open(self.squashed_tar, 'w', format=tarfile.PAX_FORMAT) as squashed_tar:
             to_skip = []
             missed_markers = {}
+            # List of filenames in the squashed archive
+            squashed_files = []
 
             for layer_id in layers_to_squash:
                 layer_tar_file = os.path.join(
@@ -521,8 +514,8 @@ class Image(object):
                     # Find all marker files for all layers
                     # We need the list of marker files upfront, so we can
                     # skip unnecessary files
-                    markers = self._marker_files(layer_tar)
-                    squashed_files = squashed_tar.getnames()
+                    members = layer_tar.getmembers()
+                    markers = self._marker_files(layer_tar, members)
 
                     # Iterate over the marker files found for this particular
                     # layer and if in the squashed layers file corresponding
@@ -538,15 +531,12 @@ class Image(object):
                             missed_markers[marker] = marker_file
 
                     # Copy all the files to the new tar
-                    for member in layer_tar.getmembers():
+                    for member in members:
                         # Skip files that are marked to be skipped
                         if self._file_should_be_skipped(member.name, to_skip):
                             self.log.debug(
                                 "Skipping '%s' file because it's on the list to skip files" % member.name)
                             continue
-
-                        # List of filenames in the squashed archive
-                        squashed_files = squashed_tar.getnames()
 
                         # Check if file is already added to the archive
                         if member.name in squashed_files:
@@ -566,7 +556,14 @@ class Image(object):
                             squashed_tar.addfile(
                                 member, layer_tar.extractfile(member))
 
-            self._add_markers(
-                missed_markers, squashed_tar, layers_to_move, self.old_image_dir)
+                        # We added a file to the squashed tar, so let's note it
+                        squashed_files.append(member.name)
+
+            # Find all files in layers that we don't squash
+            files_in_layers_to_move = self._files_in_layers(
+                layers_to_move, self.old_image_dir)
+
+            self._add_markers(missed_markers, squashed_tar,
+                              files_in_layers_to_move)
 
         self.log.info("Squashing finished!")

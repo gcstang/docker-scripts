@@ -3,7 +3,7 @@ import os
 import random
 import shutil
 
-from docker_scripts.image import Image
+from docker_squash.image import Image
 
 
 class V1Image(Image):
@@ -45,6 +45,8 @@ class V1Image(Image):
         repositories_file = os.path.join(self.new_image_dir, "repositories")
         self._generate_repositories_json(
             repositories_file, image_id, self.image_name, self.image_tag)
+
+        return image_id
 
     def _update_squashed_layer_metadata(self, old_json_file, squashed_dir):
         image_id = self._generate_image_id()

@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 
 import os
-import six
 
 from distutils.version import StrictVersion
 
-from docker_scripts.v1_image import V1Image
-from docker_scripts.v2_image import V2Image
-from docker_scripts.lib import common
-from docker_scripts.errors import SquashError
-from docker_scripts.version import version
+from docker_squash.v1_image import V1Image
+from docker_squash.v2_image import V2Image
+from docker_squash.lib import common
+from docker_squash.errors import SquashError
+from docker_squash.version import version
 
 
 class Squash(object):
@@ -27,11 +26,14 @@ class Squash(object):
         self.development = development
 
         if not docker:
-            self.docker = common.docker_client()
+            self.docker = common.docker_client(self.log)
+
+        if self.output_path:
+            self.load_image = False
 
     def run(self):
         docker_version = self.docker.version()
-        self.log.info("docker-scripts version %s, Docker %s, API %s..." %
+        self.log.info("docker-squash version %s, Docker %s, API %s..." %
                       (version, docker_version['GitCommit'], docker_version['ApiVersion']))
 
         if self.image is None:
@@ -57,7 +59,7 @@ class Squash(object):
 
         try:
             return self.squash(image)
-        except Exception:
+        except:
             # https://github.com/goldmann/docker-scripts/issues/44
             # If development mode is not enabled, make sure we clean up the
             # temporary directory
