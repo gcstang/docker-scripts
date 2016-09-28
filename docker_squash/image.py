@@ -2,6 +2,7 @@
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -10,6 +11,9 @@ import tarfile
 import tempfile
 
 from docker_squash.errors import SquashError
+
+if not six.PY3:
+    import docker_squash.lib.xtarfile
 
 
 class Chdir(object):
@@ -40,6 +44,7 @@ class Image(object):
 
     def __init__(self, log, docker, image, from_layer, tmp_dir=None, tag=None):
         self.log = log
+        self.debug = self.log.isEnabledFor(logging.DEBUG)
         self.docker = docker
         self.image = image
         self.from_layer = from_layer
@@ -140,7 +145,8 @@ class Image(object):
         # Location of the tar archive with squashed layers
         self.squashed_tar = os.path.join(self.squashed_dir, "layer.tar")
 
-        self.image_name, self.image_tag = self._parse_image_name(self.tag)
+        if self.tag:
+            self.image_name, self.image_tag = self._parse_image_name(self.tag)
 
         # The image id or name of the image to be squashed
         try:
@@ -225,8 +231,10 @@ class Image(object):
 
     def load_squashed_image(self):
         self._load_image(self.new_image_dir)
-        self.log.info("Image registered in Docker daemon as %s:%s" %
-                      (self.image_name, self.image_tag))
+
+        if self.tag:
+            self.log.info("Image registered in Docker daemon as %s:%s" %
+                          (self.image_name, self.image_tag))
 
     def _files_in_layers(self, layers, directory):
         """
@@ -238,7 +246,8 @@ class Image(object):
             self.log.debug("Generating list of files in layer '%s'..." % layer)
             tar_file = os.path.join(directory, layer, "layer.tar")
             with tarfile.open(tar_file, 'r', format=tarfile.PAX_FORMAT) as tar:
-                files[layer] = tar.getnames()
+                files[layer] = [self._normalize_path(
+                    x) for x in tar.getnames()]
             self.log.debug("Done, found %s files" % len(files[layer]))
 
         return files
@@ -266,7 +275,7 @@ class Image(object):
 
         with open(tar_file, 'rb') as f:
             self.log.debug("Loading squashed image...")
-            self.docker.load_image(f.read())
+            self.docker.load_image(f)
             self.log.debug("Image loaded!")
 
         os.remove(tar_file)
@@ -318,7 +327,14 @@ class Image(object):
                 image = self.docker.get_image(image_id)
 
                 with open(tar_file, 'wb') as f:
-                    f.write(image.data)
+                    while True:
+                        # Read about 10 MB of the tar archive
+                        data = image.read(1024000)
+
+                        if not data:
+                            break
+
+                        f.write(data)
 
                 self.log.info("Image saved!")
                 return True
@@ -382,6 +398,11 @@ class Image(object):
         if not image_id:
             raise SquashError("Provided image id cannot be null")
 
+        if name == tag == None:
+            self.log.debug(
+                "No name and tag provided for the image, skipping generating repositories file")
+            return
+
         repos = {}
         repos[name] = {}
         repos[name][tag] = image_id
@@ -423,12 +444,19 @@ class Image(object):
             self.log.debug("Moving unmodified layer '%s'..." % layer_id)
             shutil.move(os.path.join(src, layer_id), dest)
 
-    def _file_should_be_skipped(self, file_name, skipped_paths):
-        for file_path in skipped_paths:
-            if file_name == file_path or file_name.startswith(file_path + "/"):
-                return True
+    def _file_should_be_skipped(self, file_name, file_paths):
+        # file_paths is now array of array with files to be skipped.
+        # First level are layers, second are files in these layers.
+        layer_nb = 1
 
-        return False
+        for layers in file_paths:
+            for file_path in layers:
+                if file_name == file_path or file_name.startswith(file_path + "/"):
+                    return layer_nb
+
+            layer_nb += 1
+
+        return 0
 
     def _marker_files(self, tar, members):
         """
@@ -448,9 +476,11 @@ class Image(object):
                 self.log.debug("Found '%s' marker file" % member.name)
                 marker_files[member] = tar.extractfile(member)
 
+        self.log.debug("Done, found %s files" % len(marker_files))
+
         return marker_files
 
-    def _add_markers(self, markers, tar, files_in_layers):
+    def _add_markers(self, markers, tar, files_in_layers, added_symlinks):
         """
         This method is responsible for adding back all markers that were not
         added to the squashed layer AND files they refer to can be found in layers
@@ -464,19 +494,37 @@ class Image(object):
             # No marker files to add
             return
 
+        # https://github.com/goldmann/docker-squash/issues/108
+        # Some tar archives do have the filenames prefixed with './'
+        # which does not have any effect when we unpack the tar achive,
+        # but when processing tar content - we see this.
+        tar_files = [self._normalize_path(x) for x in tar.getnames()]
+
         for marker, marker_file in six.iteritems(markers):
             actual_file = marker.name.replace('.wh.', '')
+            normalized_file = self._normalize_path(actual_file)
+
             should_be_added_back = False
+
+            if self._file_should_be_skipped(normalized_file, added_symlinks):
+                self.log.debug(
+                    "Skipping '%s' marker file, this file is on a symlink path" % normalized_file)
+                continue
+
+            if normalized_file in tar_files:
+                self.log.debug(
+                    "Skipping '%s' marker file, this file was added earlier for some reason..." % normalized_file)
+                continue
 
             if files_in_layers:
                 for files in files_in_layers.values():
-                    if not self._file_should_be_skipped(actual_file, files):
+                    if normalized_file in files:
                         should_be_added_back = True
                         break
             else:
                 # There are no previous layers, so we need to add it back
                 # In fact this shouldn't happen since having a marker file
-                # where there is no previous layer doesn not make sense.
+                # where there is no previous layer does not make sense.
                 should_be_added_back = True
 
             if should_be_added_back:
@@ -486,9 +534,120 @@ class Image(object):
                 # regular files, therefore we need to recreate the tarinfo
                 # object
                 tar.addfile(tarfile.TarInfo(name=marker.name), marker_file)
+                # Add the file name to the list too to avoid re-reading all files
+                # in tar archive
+                tar_files.append(normalized_file)
             else:
                 self.log.debug(
                     "Skipping '%s' marker file..." % marker.name)
+
+    def _normalize_path(self, path):
+        return os.path.normpath(os.path.join("/", path))
+
+    def _add_hardlinks(self, squashed_tar, squashed_files, to_skip, skipped_hard_links):
+        for layer, hardlinks_in_layer in enumerate(skipped_hard_links):
+            # We need to start from 1, that's why we bump it here
+            current_layer = layer + 1
+            for member in six.itervalues(hardlinks_in_layer):
+                normalized_name = self._normalize_path(member.name)
+                normalized_linkname = self._normalize_path(member.linkname)
+
+                # Find out if the name is on the list of files to skip - if it is - get the layer number
+                # where it was found
+                layer_skip_name = self._file_should_be_skipped(
+                    normalized_name, to_skip)
+                # Do the same for linkname
+                layer_skip_linkname = self._file_should_be_skipped(
+                    normalized_linkname, to_skip)
+
+                # We need to check if we should skip adding back the hard link
+                # This can happen in the following situations:
+                # 1. hard link is on the list of files to skip
+                # 2. hard link target is on the list of files to skip
+                # 3. hard link is already in squashed files
+                # 4. hard link target is NOT in already squashed files
+                if layer_skip_name and current_layer > layer_skip_name or layer_skip_linkname and current_layer > layer_skip_linkname or normalized_name in squashed_files or normalized_linkname not in squashed_files:
+                    self.log.debug("Found a hard link '%s' to a file which is marked to be skipped: '%s', skipping link too" % (
+                        normalized_name, normalized_linkname))
+                else:
+                    if self.debug:
+                        self.log.debug("Adding hard link '%s' pointing to '%s' back..." % (
+                            normalized_name, normalized_linkname))
+
+                    squashed_files.append(normalized_name)
+                    squashed_tar.addfile(member)
+
+    def _add_file(self, member, content, squashed_tar, squashed_files, to_skip):
+        normalized_name = self._normalize_path(member.name)
+
+        if normalized_name in squashed_files:
+            self.log.debug(
+                "Skipping file '%s' because it is already squashed" % normalized_name)
+            return
+
+        if self._file_should_be_skipped(normalized_name, to_skip):
+            self.log.debug(
+                "Skipping '%s' file because it's on the list to skip files" % normalized_name)
+            return
+
+        if content:
+            squashed_tar.addfile(member, content)
+        else:
+            # Special case: other(?) files, we skip the file
+            # itself
+            squashed_tar.addfile(member)
+
+        # We added a file to the squashed tar, so let's note it
+        squashed_files.append(normalized_name)
+
+    def _add_symlinks(self, squashed_tar, squashed_files, to_skip, skipped_sym_links):
+        added_symlinks = []
+        for layer, symlinks_in_layer in enumerate(skipped_sym_links):
+            # We need to start from 1, that's why we bump it here
+            current_layer = layer + 1
+            for member in six.itervalues(symlinks_in_layer):
+
+                # Handling symlinks. This is similar to hard links with one
+                # difference. Sometimes we do want to have broken symlinks
+                # be addedeither case because these can point to locations
+                # that will become avaialble after adding volumes for example.
+                normalized_name = self._normalize_path(member.name)
+                normalized_linkname = self._normalize_path(member.linkname)
+
+                # File is already in squashed files, skipping
+                if normalized_name in squashed_files:
+                    self.log.debug(
+                        "Found a symbolic link '%s' which is already squashed, skipping" % (normalized_name))
+                    continue
+
+                if self._file_should_be_skipped(normalized_name, added_symlinks):
+                    self.log.debug(
+                        "Found a symbolic link '%s' which is on a path to previously squashed symlink, skipping" % (normalized_name))
+                    continue
+                # Find out if the name is on the list of files to skip - if it is - get the layer number
+                # where it was found
+                layer_skip_name = self._file_should_be_skipped(
+                    normalized_name, to_skip)
+                # Do the same for linkname
+                layer_skip_linkname = self._file_should_be_skipped(
+                    normalized_linkname, to_skip)
+
+                # If name or linkname was found in the lists of files to be
+                # skipped or it's not found in the squashed files
+                if layer_skip_name and current_layer > layer_skip_name or layer_skip_linkname and current_layer > layer_skip_linkname:
+                    self.log.debug("Found a symbolic link '%s' to a file which is marked to be skipped: '%s', skipping link too" % (
+                        normalized_name, normalized_linkname))
+                else:
+                    if self.debug:
+                        self.log.debug("Adding symbolic link '%s' pointing to '%s' back..." % (
+                            normalized_name, normalized_linkname))
+
+                    added_symlinks.append([normalized_name])
+
+                    squashed_files.append(normalized_name)
+                    squashed_tar.addfile(member)
+
+        return added_symlinks
 
     def _squash_layers(self, layers_to_squash, layers_to_move):
         self.log.info("Starting squashing...")
@@ -497,9 +656,16 @@ class Image(object):
         # to make the tar lighter
         layers_to_squash.reverse()
 
+        # Find all files in layers that we don't squash
+        files_in_layers_to_move = self._files_in_layers(
+            layers_to_move, self.old_image_dir)
+
         with tarfile.open(self.squashed_tar, 'w', format=tarfile.PAX_FORMAT) as squashed_tar:
             to_skip = []
-            missed_markers = {}
+            skipped_markers = {}
+            skipped_hard_links = []
+            skipped_sym_links = []
+            skipped_files = []
             # List of filenames in the squashed archive
             squashed_files = []
 
@@ -517,53 +683,105 @@ class Image(object):
                     members = layer_tar.getmembers()
                     markers = self._marker_files(layer_tar, members)
 
+                    skipped_sym_link_files = {}
+                    skipped_hard_link_files = {}
+                    files_to_skip = []
+
                     # Iterate over the marker files found for this particular
                     # layer and if in the squashed layers file corresponding
                     # to the marker file is found, then skip both files
                     for marker, marker_file in six.iteritems(markers):
                         actual_file = marker.name.replace('.wh.', '')
-                        to_skip.append(marker.name)
-                        to_skip.append(actual_file)
+                        files_to_skip.append(self._normalize_path(actual_file))
+                        skipped_markers[marker] = marker_file
 
-                        if not self._file_should_be_skipped(actual_file, squashed_files):
-                            self.log.debug(
-                                "Marker file '%s' not found in the squashed files, we'll try at the end of squashing one more time" % marker.name)
-                            missed_markers[marker] = marker_file
+                    self.log.debug(
+                        "Searching for symbolic links in '%s' archive..." % layer_tar_file)
+
+                    # Scan for all symlinks in the layer and save them
+                    # for later processing.
+                    for member in members:
+                        if member.issym():
+                            normalized_name = self._normalize_path(member.name)
+                            skipped_sym_link_files[normalized_name] = member
+                            continue
+
+                    to_skip.append(files_to_skip)
+                    skipped_sym_links.append(skipped_sym_link_files)
+
+                    self.log.debug("Done, found %s files" %
+                                   len(skipped_sym_link_files))
+                    skipped_files_in_layer = {}
 
                     # Copy all the files to the new tar
                     for member in members:
-                        # Skip files that are marked to be skipped
-                        if self._file_should_be_skipped(member.name, to_skip):
+                        # Skip all symlinks, we'll investigate them later
+                        if member.issym():
+                            continue
+
+                        normalized_name = self._normalize_path(member.name)
+
+                        if member in six.iterkeys(skipped_markers):
                             self.log.debug(
-                                "Skipping '%s' file because it's on the list to skip files" % member.name)
+                                "Skipping '%s' marker file, at the end of squashing we'll see if it's necessary to add it back" % normalized_name)
+                            continue
+
+                        if self._file_should_be_skipped(normalized_name, skipped_sym_links):
+                            self.log.debug(
+                                "Skipping '%s' file because it's on a symlink path, at the end of squashing we'll see if it's necessary to add it back" % normalized_name)
+
+                            if member.isfile():
+                                f = (member, layer_tar.extractfile(member))
+                            else:
+                                f = (member, None)
+
+                            skipped_files_in_layer[normalized_name] = f
+                            continue
+
+                        # Skip files that are marked to be skipped
+                        if self._file_should_be_skipped(normalized_name, to_skip):
+                            self.log.debug(
+                                "Skipping '%s' file because it's on the list to skip files" % normalized_name)
                             continue
 
                         # Check if file is already added to the archive
-                        if member.name in squashed_files:
+                        if normalized_name in squashed_files:
                             # File already exist in the squashed archive, skip it because
                             # file want to add is older than the one already in the archive.
                             # This is true because we do reverse squashing - from
                             # newer to older layer
                             self.log.debug(
-                                "Skipping '%s' file because it's older than file already added to the archive" % member.name)
+                                "Skipping '%s' file because it's older than file already added to the archive" % normalized_name)
                             continue
 
-                        if member.issym():
-                            # Special case: symlinks
-                            squashed_tar.addfile(member)
-                        else:
-                            # Finally add the file to archive
-                            squashed_tar.addfile(
-                                member, layer_tar.extractfile(member))
+                        # Hard links are processed after everything else
+                        if member.islnk():
+                            skipped_hard_link_files[normalized_name] = member
+                            continue
 
-                        # We added a file to the squashed tar, so let's note it
-                        squashed_files.append(member.name)
+                        content = None
 
-            # Find all files in layers that we don't squash
-            files_in_layers_to_move = self._files_in_layers(
-                layers_to_move, self.old_image_dir)
+                        if member.isfile():
+                            content = layer_tar.extractfile(member)
 
-            self._add_markers(missed_markers, squashed_tar,
-                              files_in_layers_to_move)
+                        self._add_file(member, content,
+                                       squashed_tar, squashed_files, to_skip)
+
+                    skipped_hard_links.append(skipped_hard_link_files)
+                    skipped_files.append(skipped_files_in_layer)
+
+            self._add_hardlinks(squashed_tar, squashed_files,
+                                to_skip, skipped_hard_links)
+            added_symlinks = self._add_symlinks(
+                squashed_tar, squashed_files, to_skip, skipped_sym_links)
+
+            for layer in skipped_files:
+                for member, content in six.itervalues(layer):
+                    self._add_file(member, content, squashed_tar,
+                                   squashed_files, added_symlinks)
+
+            if files_in_layers_to_move:
+                self._add_markers(skipped_markers, squashed_tar,
+                                  files_in_layers_to_move, added_symlinks)
 
         self.log.info("Squashing finished!")

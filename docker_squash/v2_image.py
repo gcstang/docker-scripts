@@ -107,7 +107,10 @@ class V2Image(Image):
     def _generate_manifest_metadata(self, image_id, image_name, image_tag, old_image_manifest, layer_paths_to_move, layer_path_id=None):
         manifest = OrderedDict()
         manifest['Config'] = "%s.json" % image_id
-        manifest['RepoTags'] = ["%s:%s" % (image_name, image_tag)]
+
+        if image_name and image_tag:
+            manifest['RepoTags'] = ["%s:%s" % (image_name, image_tag)]
+
         manifest['Layers'] = old_image_manifest[
             'Layers'][:len(layer_paths_to_move)]
 
@@ -277,10 +280,10 @@ class V2Image(Image):
         if self.layer_paths_to_move:
             config['parent'] = self.layer_paths_to_move[-1]
         else:
-            del config['parent']
+            config.pop("parent", None)
         # Update 'id' - it should be the path to the layer
         config['id'] = layer_path_id
-        del config['container']
+        config.pop("container", None)
         return config
 
     def _generate_image_metadata(self):
@@ -291,7 +294,7 @@ class V2Image(Image):
         metadata['created'] = self.date
 
         # Remove unnecessary or old fields
-        del metadata['container']
+        metadata.pop("container", None)
 
         # Remove squashed layers from history
         metadata['history'] = metadata['history'][:len(self.layers_to_move)]
